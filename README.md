@@ -1,12 +1,10 @@
 # Geometry-GRPO
 This repo studies how **verifiable RL (GRPO)** can improve **visual geometry reasoning** in **Qwen2.5-VL-3B-Instruct**. This project use the following setup:
 
-**Benchmark:** Zebra-CoT (Geometry subset)  
-**Model:** Qwen2.5-VL-3B-Instruct 
-**Training dataset:** VLAA-Thinking GeoQA170k subset
-**Metric:** open-form answer accuracy (final expression/number)
-
-
+- **Benchmark:** Zebra-CoT (Geometry subset)  
+- **Model:** Qwen2.5-VL-3B-Instruct 
+- **Training dataset:** VLAA-Thinking GeoQA170k subset
+- **Metric:** open-form answer accuracy (final expression/number)
 
 ## Roadmap 
 - **[x] Stage 0 — Baseline accuracy on the benchmark**
