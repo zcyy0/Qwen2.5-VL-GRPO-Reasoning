@@ -1,24 +1,26 @@
 # Geometry-GRPO
 This repo studies how **verifiable RL (GRPO)** can improve **visual geometry reasoning** in **Qwen2.5-VL-3B-Instruct**. This project use the following setup:
 
-- **Benchmark:** Zebra-CoT (Geometry subset)  
+- **Benchmark:** MathVision (Geometry Subsets)  
 - **Model:** Qwen2.5-VL-3B-Instruct 
-- **Training dataset:** VLAA-Thinking GeoQA170k subset
+- **Training dataset:** VLAA-Thinking GeoQA170k and Synthesis subset + Zebra COT Geometry subset
 - **Metric:** open-form answer accuracy (final expression/number)
 
 ## Roadmap 
-- **[x] Stage 0 — Baseline accuracy on the benchmark**
-  - Accuracy: 29.1%. Refer to `results/zebra_geometry_baseline_summary.json` for the evaluation summary.
-  - scripts/eval_baseline_benchmark.py contains the evaluation code
-    
-- **[ ]Stage 1 — Open-form targets + verifiable scoring**
-  - Convert VLAA-GeoQA ground truth "(A/B/C/D)" to open-form expressions
-  - Implement `math_verify`-based equivalence reward
+- **[X]Stage 1 — Data Processing + verifiable scoring**
+  - Build data processing pipelines that convert VLAA-GeoQA ground truth "(A/B/C/D)" to open-form expressions and normalize ground truth.
+  - Implement `math_verify`-based equivalence reward.
+  - Classify dataset into 3 different difficulty levels (difficulty=1,2, 3) based on the reasoning length and answer complexity.
+  - Set up train/dev/test splits and introduce curriculum learning. 
 
-- **[ ]Stage 2 — GRPO training**
-  - GRPO on GeoQA-openform (pilot: 1–2k prompts, then full ~6.5k)
-  - Track: reward stats, parse rate, length, KL, held-out eval
+- **[In Progress ]Stage 2 — GRPO training**
+  - GRPO on training data:
+    5000 examples, train in three phases. Phase 1 trains on difficulty=1 examples, phase 2 difficulty=2, phase 3 difficulty=3.
+    300 dev examples for frequent evaluation during training.
+    1000 test examples for evaluation at the end.
+  - Reward design: Outcome based reward
+  - Track: mean reward per source per difficulty level, accuracy, pass@k rate
 
-- **[ ]Stage 3 — Denser reward**
-  - Extract 1–3 intermediate checkpoints from `ds_answer`
-  - Add partial-credit reward via math_verify
+- **[ ]Stage 3 — Evaluation on Benchmark**
+- **[ ]Stage 4 — Denser reward**
+  - Explore partial-credit reward
