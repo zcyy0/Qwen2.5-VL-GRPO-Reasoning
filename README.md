@@ -9,7 +9,14 @@ This project implements **GRPO (Group Relative Policy Optimization)** with verif
 The goal is to bootstrap the model's reasoning capabilities by strictly enforcing a `<think>...</think><answer>...</answer>` structure via Reinforcement Learning (GRPO). The reward function $R(y)$ is designed to penalize "shortcut learning" (guessing the answer without reasoning).
 ### Reward Function Logic
 The reward is assigned based on a hierarchy of constraints:
-
+$$
+R(y) = 
+\begin{cases} 
+1.0 & \text{if Correct Answer AND Strict Format } \\
+0.5 & \text{if Correct Answer BUT only answer tags present} \\
+0.0 & \text{otherwise}
+\end{cases}
+$$
 
 Future Work: Transition to Dense Process Rewards. Move from format-checking to logic-checking by implementing a heuristic that verifies intermediate steps inside the `<think>` block.
 
