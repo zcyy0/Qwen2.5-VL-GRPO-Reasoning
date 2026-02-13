@@ -11,7 +11,7 @@ This project implements **GRPO (Group Relative Policy Optimization)** with verif
 **Training Data:** [VLAA-Thinking GeoQA and Synthesis subset](https://huggingface.co/datasets/open-thoughts/OpenThoughts-114k) and [Zebra CoT Geometry subset](https://huggingface.co/datasets/multimodal-reasoning-lab/Zebra-CoT)
 
 ## 🔬 Methodology: Structure-Aware Reward Modeling
-The goal is to bootstrap the model's reasoning capabilities by strictly enforcing a `<think>...</think><answer></answer>` structure via Reinforcement Learning (GRPO). The reward function $R(y)$ is designed to penalize "shortcut learning" (guessing the answer without reasoning).
+The goal is to bootstrap the model's reasoning capabilities by strictly enforcing a `<think>...</think><answer>...</answer>` structure via Reinforcement Learning (GRPO). The reward function $R(y)$ is designed to penalize "shortcut learning" (guessing the answer without reasoning).
 ### Reward Function Logic
 The reward is assigned based on a hierarchy of constraints:
 
@@ -19,8 +19,8 @@ $$
 R(y) = 
 \begin{cases} 
 1.0 & \text{if Correct Answer AND Strict Format } (\texttt{<think>...<answer>}) \\
-0.5 & \text{if Correct Answer BUT on} \\
-0.0 & \text{if Incorrect Answer}
+0.5 & \text{if Correct Answer BUT only answer tags present} \\
+0.0 & \text{otherwise}
 \end{cases}
 $$
 ## 🔮 Future Work & Roadmap
