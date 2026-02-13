@@ -18,10 +18,17 @@ R(y) =
 0.0 & \text{otherwise}
 \end{cases}
 $$
-## 🔮 Future Work & Roadmap
-* **Transition to Dense Process Rewards:** Move from format-checking to logic-checking by implementing a heuristic that verifies intermediate steps inside the `<think>` block.
+Future Work: Transition to Dense Process Rewards. Move from format-checking to logic-checking by implementing a heuristic that verifies intermediate steps inside the `<think>` block.
 
-
+### Project Structure
+```bash
+├── train/
+│   ├── train_grpo.py       # Main training loop using TRL
+├── scripts/
+│   └── exploratory_eda.ipynb # Analysis of the dataset distribution
+├── utils/
+│   └── extract_answers.py # helper functions to extract and normalize answers
+└── README.md
 
 - **Benchmark:** MathVision
 - **Model:** Qwen2.5-VL-3B-Instruct 
