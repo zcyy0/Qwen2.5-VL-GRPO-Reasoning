@@ -13,7 +13,7 @@ The reward is assigned based on a hierarchy of constraints:
 $$
 R(y) = 
 \begin{cases} 
-1.0 & \text{if Correct Answer AND Strict Format } (\texttt{<think>...<answer>}) \\
+1.0 & \text{if Correct Answer AND Strict Format } \\
 0.5 & \text{if Correct Answer BUT only answer tags present} \\
 0.0 & \text{otherwise}
 \end{cases}
