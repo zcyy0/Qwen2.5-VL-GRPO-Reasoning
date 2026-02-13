@@ -10,14 +10,7 @@ The goal is to bootstrap the model's reasoning capabilities by strictly enforcin
 ### Reward Function Logic
 The reward is assigned based on a hierarchy of constraints:
 
-$$
-R(y) = 
-\begin{cases} 
-1.0 & \text{if Correct Answer AND Strict Format } \\
-0.5 & \text{if Correct Answer BUT only answer tags present} \\
-0.0 & \text{otherwise}
-\end{cases}
-$$
+
 Future Work: Transition to Dense Process Rewards. Move from format-checking to logic-checking by implementing a heuristic that verifies intermediate steps inside the `<think>` block.
 
 ### Project Structure
@@ -30,16 +23,8 @@ Future Work: Transition to Dense Process Rewards. Move from format-checking to l
 │   └── extract_answers.py # helper functions to extract and normalize answers
 └── README.md
 
-- **Benchmark:** MathVision
-- **Model:** Qwen2.5-VL-3B-Instruct 
-- **Training dataset:**
-  - VLAA-Thinking GeoQA170k and Synthesis subset
-  - Zebra COT Geometry subset
-- **Metric:** match accuracy + pass@k rate
 
-
-
-## Roadmap 
+## Progress
 - **[X]Stage 1 — Process data and build verifiable scoring**
   - Build data processing pipelines that convert VLAA-GeoQA multiple choice ground truth "(A/B/C/D)" to open-form expressions, and normalize the datasets' ground truths to standard latext math expressions.
   - Implement `math_verify`-based equivalence reward.
