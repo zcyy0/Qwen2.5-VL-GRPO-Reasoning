@@ -32,10 +32,6 @@ R(y) =
 \end{cases}
 $$
 
-**Why this matters:**
-* **Partial Credit (0.5):** Prevents reward collapse early in training when the model has not yet learned the XML tag structure but gets the answer right.
-* **Strict Format (1.0):** Incentivizes the model to shift probability mass toward explicit reasoning chains.
-
 ---
 
 ## 🛠️ Data Engineering & Curriculum
