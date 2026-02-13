@@ -29,7 +29,7 @@ Future Work: Transition to Dense Process Rewards. Move from format-checking to l
 ├── utils/
 │   └── extract_answers.py # helper functions to extract and normalize answers
 └── README.md
-
+```
 
 ## Progress
 - **[X]Stage 1 — Process data and build verifiable scoring**
