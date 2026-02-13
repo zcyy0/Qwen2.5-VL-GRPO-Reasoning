@@ -9,6 +9,25 @@ This project implements **GRPO (Group Relative Policy Optimization)** with verif
 
 **Target Benchmark:** [MathVision](https://huggingface.co/datasets/mathvision/mathvision)
 **Training Data:** [VLAA-Thinking GeoQA and Synthesis subset](https://huggingface.co/datasets/open-thoughts/OpenThoughts-114k) and [Zebra CoT Geometry subset](https://huggingface.co/datasets/multimodal-reasoning-lab/Zebra-CoT)
+
+## 🔬 Methodology: Structure-Aware Reward Modeling
+The goal is to bootstrap the model's reasoning capabilities by strictly enforcing a `<think>` ... `<answer>` structure via Reinforcement Learning (GRPO). The reward function $R(y)$ is designed to penalize "shortcut learning" (guessing the answer without reasoning).
+### Reward Function Logic
+The reward is assigned based on a hierarchy of constraints:
+
+$$
+R(y) = 
+\begin{cases} 
+1.0 & \text{if Correct Answer AND Strict Format } (\texttt{<think>...<answer>}) \\
+0.5 & \text{if Correct Answer BUT Format Violation} \\
+0.0 & \text{if Incorrect Answer}
+\end{cases}
+$$
+## 🔮 Future Work & Roadmap
+* **Transition to Dense Process Rewards:** Move from format-checking to logic-checking by implementing a heuristic that verifies intermediate steps inside the `<think>` block.
+
+
+
 - **Benchmark:** MathVision
 - **Model:** Qwen2.5-VL-3B-Instruct 
 - **Training dataset:**
