@@ -175,13 +175,13 @@ class RewardTracker:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._records = []  # (reward, difficulty, source, has_strict, has_answer_tags, is_correct, prompt_id, comp_len)
+        self._records = []  # (reward, difficulty, source, has_strict, has_answer_tags, is_correct, prompt_id, comp_len, parsed_ok)
 
     def record(self, reward: float, difficulty: int, source: str,
                has_strict: bool, has_answer_tags: bool, is_correct: bool,
-               prompt_id: str, comp_len: int = 0):
+               prompt_id: str, comp_len: int = 0, parsed_ok: bool = True):
         with self._lock:
-            self._records.append((reward, difficulty, source, has_strict, has_answer_tags, is_correct, prompt_id, comp_len))
+            self._records.append((reward, difficulty, source, has_strict, has_answer_tags, is_correct, prompt_id, comp_len, parsed_ok))
 
     def flush(self) -> dict:
         """Return per-group averages and clear the buffer."""
@@ -194,36 +194,40 @@ class RewardTracker:
 
         n_total = len(recs)
         n_strict_correct = 0
-        n_answer_only_correct = 0
+        n_strict_incorrect = 0
 
         by_diff = defaultdict(list)
         by_src = defaultdict(list)
         prompt_has_strict_correct = set()
-        prompt_has_answer_only_correct = set()
+        prompt_has_strict_incorrect = set()
         all_prompts = set()
 
         total_comp_len = 0
-        for rew, diff, src, has_strict, has_answer_tags, is_correct, prompt_id, comp_len in recs:
+        total_parse_ok = 0
+        for rew, diff, src, has_strict, has_answer_tags, is_correct, prompt_id, comp_len, parsed_ok in recs:
             by_diff[diff].append(rew)
             by_src[src].append(rew)
             all_prompts.add(prompt_id)
             total_comp_len += comp_len
+            if parsed_ok:
+                total_parse_ok += 1
 
             if has_strict and is_correct:
                 n_strict_correct += 1
                 prompt_has_strict_correct.add(prompt_id)
-            elif has_answer_tags and (not has_strict) and is_correct:
-                n_answer_only_correct += 1
-                prompt_has_answer_only_correct.add(prompt_id)
+            elif has_strict and not is_correct:
+                n_strict_incorrect += 1
+                prompt_has_strict_incorrect.add(prompt_id)
 
         n_prompts = max(1, len(all_prompts))
 
         metrics = {
             "train/gen_strict_correct_pct": n_strict_correct / n_total,
-            "train/gen_answer_only_correct_pct": n_answer_only_correct / n_total,
+            "train/gen_strict_incorrect_pct": n_strict_incorrect / n_total,
             "train/prompt_strict_correct_pct": len(prompt_has_strict_correct) / n_prompts,
-            "train/prompt_answer_only_correct_pct": len(prompt_has_answer_only_correct) / n_prompts,
-            "train/avg_completion_len": total_comp_len / n_total,
+            "train/prompt_strict_incorrect_pct": len(prompt_has_strict_incorrect) / n_prompts,
+            "train/parse_success_rate": total_parse_ok / n_total,
+            "train/avg_completion_tokens": total_comp_len / n_total,
         }
 
         for src, vals in sorted(by_src.items()):
@@ -235,17 +239,28 @@ class RewardTracker:
 
 # Module-level tracker instance (accessed by reward functions & callback)
 _reward_tracker = RewardTracker()
+_tokenizer = None  # set in main() for token-count logging
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Reward functions
 # ──────────────────────────────────────────────────────────────────────────────
 
-def combined_reward(completions, gt=None, source=None, difficulty=None, id=None, **kwargs):
-    """Single reward function with three tiers:
-      1.0 — strict format (<think>...</think> <answer>...</answer>) AND correct
-      0.5 — answer tags present (not strict) AND correct
-      0.0 — otherwise
+def format_reward(completions, **kwargs):
+    """Returns 0.1 if strict format (<think>...</think> <answer>...</answer>), 0.0 otherwise."""
+    rewards = []
+    for comp in completions:
+        text = completion_to_text(comp)
+        flags = tag_flags(text)
+        has_strict = flags["has_strict_block"]
+        rewards.append(0.1 if has_strict else 0.0)
+    return rewards
+
+
+def accuracy_reward(completions, gt=None, source=None, difficulty=None, id=None, **kwargs):
+    """Returns 0.9 if strict format AND correct answer, 0.0 otherwise.
+
+    Also records combined reward (format + accuracy) to the reward tracker.
     """
     rewards = []
     n = len(completions)
@@ -269,31 +284,30 @@ def combined_reward(completions, gt=None, source=None, difficulty=None, id=None,
         has_answer_tags = flags["has_answer_open"] and flags["has_answer_close"]
 
         pred, _method = extract_model_answer(text)
-        if pred is None:
-            is_correct = False
-        else:
+        parsed_ok = pred is not None
+        if parsed_ok:
             score, _, _ = score_one(str(gold), pred)
             is_correct = score > 0
-
-        if has_strict and is_correct:
-            rew = 1.0
-        elif has_answer_tags and is_correct:
-            rew = 0.5
         else:
-            rew = 0.0
+            is_correct = False
 
-        rewards.append(rew)
+        acc_rew = 0.9 if (has_strict and is_correct) else 0.0
+        rewards.append(acc_rew)
+
+        # Record combined reward (format + accuracy) for logging
+        total_rew = (0.1 if has_strict else 0.0) + acc_rew
 
         try:
             diff_int = int(diff)
         except (TypeError, ValueError):
             diff_int = 0
-        _reward_tracker.record(rew, diff_int, src,
+        _reward_tracker.record(total_rew, diff_int, src,
                                has_strict=has_strict,
                                has_answer_tags=has_answer_tags,
                                is_correct=is_correct,
                                prompt_id=str(pid),
-                               comp_len=len(text))
+                               comp_len=len(_tokenizer.encode(text, add_special_tokens=False)) if _tokenizer else len(text),
+                               parsed_ok=parsed_ok)
 
     return rewards
 
@@ -307,9 +321,9 @@ class RewardTrackerCallback(TrainerCallback):
 
     Prints training metrics every log_every steps:
       gen_strict_correct_pct — % of generations with strict format AND correct (reward=1.0)
-      gen_answer_only_correct_pct — % with answer tags only (not strict) AND correct (reward=0.5)
+      gen_strict_incorrect_pct — % with strict format but incorrect answer (reward=0.1)
       prompt_strict_correct_pct — % of prompts with >=1 strict+correct gen
-      prompt_answer_only_correct_pct — % of prompts with >=1 answer-only+correct gen
+      prompt_strict_incorrect_pct — % of prompts with >=1 strict+incorrect gen
       reward_by_source — mean reward per source
     """
 
@@ -322,12 +336,14 @@ class RewardTrackerCallback(TrainerCallback):
         metrics = _reward_tracker.flush()
         if metrics:
             gsc = metrics.get("train/gen_strict_correct_pct", 0)
-            gac = metrics.get("train/gen_answer_only_correct_pct", 0)
+            gsi = metrics.get("train/gen_strict_incorrect_pct", 0)
             psc = metrics.get("train/prompt_strict_correct_pct", 0)
-            pac = metrics.get("train/prompt_answer_only_correct_pct", 0)
+            psi = metrics.get("train/prompt_strict_incorrect_pct", 0)
+            psr = metrics.get("train/parse_success_rate", 0)
             print(f"\n[Step {state.global_step}] Training metrics:")
-            print(f"  gen_strict_correct={gsc:.2%}  gen_answer_only_correct={gac:.2%}")
-            print(f"  prompt_strict_correct={psc:.2%}  prompt_answer_only_correct={pac:.2%}")
+            print(f"  gen_strict_correct={gsc:.2%}  gen_strict_incorrect={gsi:.2%}")
+            print(f"  prompt_strict_correct={psc:.2%}  prompt_strict_incorrect={psi:.2%}")
+            print(f"  parse_success_rate={psr:.2%}")
             # Per-source reward (mean ± std)
             sources = sorted(set(
                 k.split("/")[-2] for k in metrics if "reward_by_source/" in k and "/mean" in k
@@ -336,8 +352,8 @@ class RewardTrackerCallback(TrainerCallback):
                 avg_r = metrics.get(f"train/reward_by_source/{src}/mean", 0)
                 std_r = metrics.get(f"train/reward_by_source/{src}/std", 0)
                 print(f"  reward_by_source/{src}: {avg_r:.3f} ± {std_r:.3f}")
-            avg_clen = metrics.get("train/avg_completion_len", 0)
-            print(f"  avg_completion_len={avg_clen:.0f}")
+            avg_clen = metrics.get("train/avg_completion_tokens", 0)
+            print(f"  avg_completion_tokens={avg_clen:.0f}")
             if wandb.run is not None:
                 wandb.log(metrics, step=state.global_step)
         return control
@@ -510,122 +526,173 @@ def generate_from_prompt(model, processor, prompt_text, image_pil,
 
 def compute_eval_metrics(model, processor, ds_subset: Dataset, max_new_tokens: int,
                          num_samples: int = 8, temperature: float = 0.8):
-    """Compute pass@k evaluation metrics with per-source x difficulty breakdowns.
+    """Compute evaluation metrics, distributing work across GPUs when available.
 
-    For each prompt, generates num_samples samples (temperature sampling) and computes:
-      - gen_strict_correct_pct, gen_answer_only_correct_pct
-      - prompt_strict_correct_pct, prompt_answer_only_correct_pct
-      - eval/accuracy/{src}/d{diff} — fraction of correct generations
-      - eval/pass@{k}/{src}/d{diff} — fraction of prompts with >=1 correct
-      - eval/parse_success_rate — overall parse rate
-      - eval/reward_by_source/{src} — mean reward per source
+    Automatically shards the dataset across ranks, evaluates in parallel,
+    gathers results, and computes metrics on rank 0.
+
+    Returns metrics dict on rank 0, empty dict on other ranks.
     """
-    n = len(ds_subset)
-    if n == 0:
+    n_total = len(ds_subset)
+    if n_total == 0:
         return {}
 
     k = num_samples
 
-    # Accumulators
-    total_gens = 0
-    total_strict_correct = 0
-    total_answer_only_correct = 0
-    total_parse_ok = 0
+    # Detect distributed environment
+    distributed = torch.distributed.is_initialized()
+    if distributed:
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
 
-    all_prompts = set()
-    prompt_has_strict_correct = set()
-    prompt_has_answer_only_correct = set()
+    # Unwrap DDP model for inference
+    eval_model = model.module if hasattr(model, "module") else model
 
-    # Per source x difficulty
-    src_diff_n_gen = Counter()       # (src, diff) -> num generations
-    src_diff_n_correct = Counter()   # (src, diff) -> num correct generations
-    src_diff_n_prompts = Counter()   # (src, diff) -> num prompts
-    src_diff_prompt_any_correct = defaultdict(set)  # (src, diff) -> set of prompt ids with >=1 correct
+    # Shard dataset across ranks
+    if distributed:
+        indices = list(range(rank, n_total, world_size))
+        local_ds = ds_subset.select(indices)
+    else:
+        local_ds = ds_subset
+    n_local = len(local_ds)
 
-    # Per source reward and per source x difficulty reward
-    by_src_rewards = defaultdict(list)
-    by_src_diff_rewards = defaultdict(list)  # (src, diff) -> list of rewards
+    # Pick 5 random local indices for debug printing (rank 0 only)
+    import random as _random
+    debug_indices = set(_random.sample(range(n_local), min(5, n_local)))
 
-    total_comp_len = 0
+    # Collect per-generation records on each rank
+    records = []
+    for i in range(n_local):
+        if rank == 0 and i % 10 == 0:
+            print(f"[Eval] Rank 0: {i}/{n_local} "
+                  f"(~{i * world_size}/{n_total} total)...")
 
-    for i in range(n):
-        if i % 10 == 0:
-            print(f"[Eval] Processing {i}/{n}...")
-
-        ex = ds_subset[i]
+        ex = local_ds[i]
         src = ex["source"]
         diff = ex.get("difficulty", 0)
         pid = ex.get("id", str(i))
         gold = ex["gt"]
-        sd_key = (src, diff)
-
-        all_prompts.add(pid)
-        src_diff_n_prompts[sd_key] += 1
 
         samples = generate_from_prompt(
-            model, processor, ex["prompt_text"], ex["image"], max_new_tokens,
-            num_samples=k, temperature=temperature,
+            eval_model, processor, ex["prompt_text"], ex["image"],
+            max_new_tokens, num_samples=k, temperature=temperature,
         )
         if k == 1:
             samples = [samples]
 
-        if i < 3:
-            print(f"\n[DEBUG] Example {i}: src={src} diff={diff}")
-            text0 = samples[0][0] if samples else ""
-            print(f"  Sample 0 (first 300 chars): {text0[:300] if text0 else '(empty)'}...")
-
-        prompt_has_any_correct = False
-        for decoded, clen in samples:
-            total_gens += 1
-            total_comp_len += clen
-            src_diff_n_gen[sd_key] += 1
-
+        for s_idx, (decoded, clen) in enumerate(samples):
             flags = tag_flags(decoded)
             has_strict = flags["has_strict_block"]
             has_answer_tags = flags["has_answer_open"] and flags["has_answer_close"]
 
             pred, _method = extract_model_answer(decoded)
-            if pred is not None:
-                total_parse_ok += 1
-                score, _, _ = score_one(gold, pred)
+            parsed_ok = pred is not None
+            if parsed_ok:
+                score, gt_norm, pred_norm = score_one(str(gold), pred)
                 is_correct = score > 0
             else:
                 is_correct = False
+                gt_norm = normalize_answer_comprehensive(str(gold))
+                pred_norm = None
 
-            # Compute reward tier
             if has_strict and is_correct:
                 rew = 1.0
-                total_strict_correct += 1
-                prompt_has_strict_correct.add(pid)
-            elif has_answer_tags and is_correct:
-                rew = 0.5
-                total_answer_only_correct += 1
-                prompt_has_answer_only_correct.add(pid)
+            elif has_strict:
+                rew = 0.1
             else:
                 rew = 0.0
 
-            by_src_rewards[src].append(rew)
-            by_src_diff_rewards[sd_key].append(rew)
+            # Print detailed debug info for 5 random examples (sample 0 only)
+            if rank == 0 and i in debug_indices and s_idx == 0:
+                print(f"\n[DEBUG] Example {i}: src={src} diff={diff} id={pid}")
+                print(f"  Ground truth (raw):  {gold}")
+                print(f"  Ground truth (norm): {gt_norm}")
+                print(f"  Model output: {decoded}")
+                print(f"  Extracted answer: {pred}")
+                print(f"  Extracted (norm):  {pred_norm}")
+                print(f"  Correct={is_correct}  Strict={has_strict}  Reward={rew}")
 
-            if is_correct:
-                src_diff_n_correct[sd_key] += 1
-                prompt_has_any_correct = True
+            records.append({
+                "src": src, "diff": diff, "pid": pid,
+                "has_strict": has_strict, "has_answer_tags": has_answer_tags,
+                "is_correct": is_correct, "rew": rew, "clen": clen,
+                "parsed_ok": parsed_ok,
+            })
 
-        if prompt_has_any_correct:
+    # Gather records from all ranks
+    if distributed:
+        gathered = [None] * world_size
+        torch.distributed.all_gather_object(gathered, records)
+        all_records = [r for shard in gathered for r in shard]
+        # Only rank 0 computes metrics
+        if rank != 0:
+            return {}
+    else:
+        all_records = records
+
+    # ── Compute metrics from gathered records (rank 0 only) ──
+    total_gens = len(all_records)
+    if total_gens == 0:
+        return {}
+
+    total_strict_correct = 0
+    total_strict_incorrect = 0
+    total_parse_ok = 0
+    total_comp_len = 0
+
+    all_prompts = set()
+    prompt_has_strict_correct = set()
+    prompt_has_strict_incorrect = set()
+
+    src_diff_n_gen = Counter()
+    src_diff_n_correct = Counter()
+    src_diff_prompts = defaultdict(set)
+    src_diff_prompt_any_correct = defaultdict(set)
+
+    by_src_rewards = defaultdict(list)
+    by_src_diff_rewards = defaultdict(list)
+
+    for rec in all_records:
+        src, diff, pid = rec["src"], rec["diff"], rec["pid"]
+        sd_key = (src, diff)
+
+        total_comp_len += rec["clen"]
+        if rec["parsed_ok"]:
+            total_parse_ok += 1
+
+        if rec["has_strict"] and rec["is_correct"]:
+            total_strict_correct += 1
+            prompt_has_strict_correct.add(pid)
+        elif rec["has_strict"] and not rec["is_correct"]:
+            total_strict_incorrect += 1
+            prompt_has_strict_incorrect.add(pid)
+
+        all_prompts.add(pid)
+        src_diff_n_gen[sd_key] += 1
+        src_diff_prompts[sd_key].add(pid)
+        by_src_rewards[src].append(rec["rew"])
+        by_src_diff_rewards[sd_key].append(rec["rew"])
+
+        if rec["is_correct"]:
+            src_diff_n_correct[sd_key] += 1
             src_diff_prompt_any_correct[sd_key].add(pid)
 
-    print(f"[Eval] Finished evaluation on {n} examples ({total_gens} total generations).")
-
     n_prompts = max(1, len(all_prompts))
-    total_gens = max(1, total_gens)
+    total_gens_safe = max(1, total_gens)
+
+    print(f"[Eval] Finished: {len(all_prompts)} prompts, "
+          f"{total_gens} generations across {world_size} GPU(s).")
 
     metrics = {
-        "eval/gen_strict_correct_pct": total_strict_correct / total_gens,
-        "eval/gen_answer_only_correct_pct": total_answer_only_correct / total_gens,
+        "eval/gen_strict_correct_pct": total_strict_correct / total_gens_safe,
+        "eval/gen_strict_incorrect_pct": total_strict_incorrect / total_gens_safe,
         "eval/prompt_strict_correct_pct": len(prompt_has_strict_correct) / n_prompts,
-        "eval/prompt_answer_only_correct_pct": len(prompt_has_answer_only_correct) / n_prompts,
-        "eval/parse_success_rate": total_parse_ok / total_gens,
-        "eval/avg_completion_len": total_comp_len / total_gens,
+        "eval/prompt_strict_incorrect_pct": len(prompt_has_strict_incorrect) / n_prompts,
+        "eval/parse_success_rate": total_parse_ok / total_gens_safe,
+        "eval/avg_completion_tokens": total_comp_len / total_gens_safe,
     }
 
     # Per source reward (mean ± std)
@@ -637,7 +704,7 @@ def compute_eval_metrics(model, processor, ds_subset: Dataset, max_new_tokens: i
     for sd_key in sorted(src_diff_n_gen.keys()):
         src, diff = sd_key
         n_gen = max(1, src_diff_n_gen[sd_key])
-        n_prompt = max(1, src_diff_n_prompts[sd_key])
+        n_prompt = max(1, len(src_diff_prompts[sd_key]))
         n_correct = src_diff_n_correct[sd_key]
         n_pass = len(src_diff_prompt_any_correct[sd_key])
         metrics[f"eval/accuracy/{src}/d{diff}"] = n_correct / n_gen
@@ -653,73 +720,125 @@ def compute_eval_metrics(model, processor, ds_subset: Dataset, max_new_tokens: i
 # Evaluation callback (runs within a phase)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FixedBatchEvalCallback(TrainerCallback):
-    def __init__(self, processor, dev_subset, max_new_tokens: int,
-                 log_every_steps: int, global_step_offset: int = 0,
-                 num_samples: int = 8, temperature: float = 0.8):
+class EvalCallback(TrainerCallback):
+    """Two-tier evaluation callback with distributed support.
+
+    Quick eval: every ``quick_every`` steps on a fixed subset (greedy, 1 sample).
+    Full eval:  once at the midpoint of the phase (end-of-phase is handled
+                separately in main()).
+
+    Work is sharded across GPUs automatically by compute_eval_metrics.
+    Printing and wandb logging happen on rank 0 only.
+    """
+
+    def __init__(self, processor, dev_dataset, max_new_tokens: int,
+                 quick_every: int, phase_steps: int,
+                 quick_n: int = 100, num_samples: int = 8,
+                 temperature: float = 0.8, global_step_offset: int = 0,
+                 seed: int = 42):
         self.processor = processor
-        self.dev_subset = dev_subset
+        self.dev_dataset = dev_dataset          # full dev set
         self.max_new_tokens = max_new_tokens
-        self.log_every_steps = log_every_steps
-        self.global_step_offset = global_step_offset
+        self.quick_every = quick_every
+        self.mid_step = phase_steps // 2        # full eval at midpoint
         self.num_samples = num_samples
         self.temperature = temperature
+        self.global_step_offset = global_step_offset
+        self._rank = (torch.distributed.get_rank()
+                      if torch.distributed.is_initialized() else 0)
 
-    def _run_evaluation(self, model, state):
-        was_training = model.training
-        model.eval()
+        # Subset for quick eval (same on all ranks)
+        n = len(dev_dataset)
+        if quick_n >= n:
+            self.quick_subset = dev_dataset
+        else:
+            import random
+            rng = random.Random(seed)
+            indices = rng.sample(range(n), quick_n)
+            self.quick_subset = dev_dataset.select(indices)
 
-        real_step = state.global_step + self.global_step_offset
-        print(f"\n[Step {real_step}] Running pass@{self.num_samples} evaluation...")
-        dev_metrics = compute_eval_metrics(
-            model, self.processor, self.dev_subset, self.max_new_tokens,
-            num_samples=self.num_samples, temperature=self.temperature,
-        )
-
-        if was_training:
-            model.train()
-
-        print(f"\n[Step {real_step}] Evaluation Summary:")
-        gsc = dev_metrics.get("eval/gen_strict_correct_pct", 0)
-        gac = dev_metrics.get("eval/gen_answer_only_correct_pct", 0)
-        psc = dev_metrics.get("eval/prompt_strict_correct_pct", 0)
-        pac = dev_metrics.get("eval/prompt_answer_only_correct_pct", 0)
-        psr = dev_metrics.get("eval/parse_success_rate", 0)
-        acl = dev_metrics.get("eval/avg_completion_len", 0)
-        print(f"  gen_strict_correct={gsc:.2%}  gen_answer_only_correct={gac:.2%}")
-        print(f"  prompt_strict_correct={psc:.2%}  prompt_answer_only_correct={pac:.2%}")
-        print(f"  parse_success_rate={psr:.2%}  avg_completion_len={acl:.0f}")
+    def _print_metrics(self, dev_metrics, prefix="eval"):
+        """Print metric summary (rank 0 only — caller must guard)."""
+        gsc = dev_metrics.get(f"{prefix}/gen_strict_correct_pct", 0)
+        gsi = dev_metrics.get(f"{prefix}/gen_strict_incorrect_pct", 0)
+        psc = dev_metrics.get(f"{prefix}/prompt_strict_correct_pct", 0)
+        psi = dev_metrics.get(f"{prefix}/prompt_strict_incorrect_pct", 0)
+        psr = dev_metrics.get(f"{prefix}/parse_success_rate", 0)
+        acl = dev_metrics.get(f"{prefix}/avg_completion_tokens", 0)
+        print(f"  gen_strict_correct={gsc:.2%}  gen_strict_incorrect={gsi:.2%}")
+        print(f"  prompt_strict_correct={psc:.2%}  prompt_strict_incorrect={psi:.2%}")
+        print(f"  parse_success_rate={psr:.2%}  avg_completion_tokens={acl:.0f}")
         # Per-source reward (mean ± std)
         src_keys = sorted(set(
             k.split("/")[-2] for k in dev_metrics if "reward_by_source/" in k and "/mean" in k
         ))
         for src in src_keys:
-            m = dev_metrics.get(f"eval/reward_by_source/{src}/mean", 0)
-            s = dev_metrics.get(f"eval/reward_by_source/{src}/std", 0)
+            m = dev_metrics.get(f"{prefix}/reward_by_source/{src}/mean", 0)
+            s = dev_metrics.get(f"{prefix}/reward_by_source/{src}/std", 0)
             print(f"  reward_by_source/{src}: {m:.3f} ± {s:.3f}")
         # Per source x difficulty: accuracy, pass@k, reward mean±std
         for key in sorted(dev_metrics):
             if "accuracy/" in key or "pass@" in key:
                 print(f"  {key}: {dev_metrics[key]:.4f}")
-            elif key.startswith("eval/reward/") and "/mean" in key:
+            elif key.startswith(f"{prefix}/reward/") and "/mean" in key:
                 base = key.replace("/mean", "")
                 m = dev_metrics[key]
                 s = dev_metrics.get(base + "/std", 0)
-                label = base.replace("eval/", "")
+                label = base.replace(f"{prefix}/", "")
                 print(f"  {label}: {m:.3f} ± {s:.3f}")
 
-        if wandb.run is not None:
-            wandb.log(dev_metrics, step=real_step)
+    def _run_quick_eval(self, model, state):
+        was_training = model.training
+        model.eval()
+        real_step = state.global_step + self.global_step_offset
+        if self._rank == 0:
+            print(f"\n[Step {real_step}] Quick eval "
+                  f"({len(self.quick_subset)} examples, greedy)...")
+        metrics = compute_eval_metrics(
+            model, self.processor, self.quick_subset, self.max_new_tokens,
+            num_samples=1, temperature=self.temperature,
+        )
+        if was_training:
+            model.train()
+        # metrics is non-empty only on rank 0
+        if self._rank == 0 and metrics:
+            metrics = {k.replace("eval/", "quick_eval/"): v
+                       for k, v in metrics.items()}
+            print(f"\n[Step {real_step}] Quick Eval Summary:")
+            self._print_metrics(metrics, prefix="quick_eval")
+            if wandb.run is not None:
+                wandb.log(metrics, step=real_step)
+        return metrics
 
-        return dev_metrics
+    def _run_full_eval(self, model, state):
+        was_training = model.training
+        model.eval()
+        real_step = state.global_step + self.global_step_offset
+        if self._rank == 0:
+            print(f"\n[Step {real_step}] Full eval "
+                  f"({len(self.dev_dataset)} examples, pass@{self.num_samples})...")
+        metrics = compute_eval_metrics(
+            model, self.processor, self.dev_dataset, self.max_new_tokens,
+            num_samples=self.num_samples, temperature=self.temperature,
+        )
+        if was_training:
+            model.train()
+        if self._rank == 0 and metrics:
+            print(f"\n[Step {real_step}] Full Eval Summary:")
+            self._print_metrics(metrics, prefix="eval")
+            if wandb.run is not None:
+                wandb.log(metrics, step=real_step)
+        return metrics
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step == 0:
             return control
-        if state.global_step % self.log_every_steps != 0:
-            return control
         model = kwargs["model"]
-        self._run_evaluation(model, state)
+        # Full eval at midpoint (skip quick eval on the same step)
+        if self.mid_step > 0 and state.global_step == self.mid_step:
+            self._run_full_eval(model, state)
+        elif self.quick_every > 0 and state.global_step % self.quick_every == 0:
+            self._run_quick_eval(model, state)
         return control
 
 
@@ -752,7 +871,7 @@ def build_trainer(
     max_steps: int,
     global_step_offset: int,
     dev_subset: Dataset,
-    beta: float = 0.04,
+    beta: float = 0.0,
 ):
     """Create a GRPOTrainer for a single curriculum phase."""
     phase_output_dir = Path(args.output_dir) / f"phase{phase}"
@@ -799,7 +918,7 @@ def build_trainer(
     trainer = GRPOTrainer(
         model=model,
         processing_class=processor,
-        reward_funcs=[combined_reward],
+        reward_funcs=[format_reward, accuracy_reward],
         args=training_args,
         train_dataset=parse_prompt_column(train_ds),
         eval_dataset=parse_prompt_column(eval_ds),
@@ -808,16 +927,18 @@ def build_trainer(
     # Add per-group reward tracker callback (same cadence as HF logging)
     trainer.add_callback(RewardTrackerCallback(log_every=args.logging_steps))
 
-    # Add periodic eval callback
-    if args.eval_every_steps > 0 and dev_subset is not None:
-        trainer.add_callback(FixedBatchEvalCallback(
+    # Add two-tier eval callback (quick every N steps, full at midpoint)
+    if dev_subset is not None and args.quick_eval_steps > 0:
+        trainer.add_callback(EvalCallback(
             processor=processor,
-            dev_subset=dev_subset,
+            dev_dataset=dev_subset,
             max_new_tokens=args.max_completion_length,
-            log_every_steps=args.eval_every_steps,
-            global_step_offset=global_step_offset,
+            quick_every=args.quick_eval_steps,
+            phase_steps=max_steps,
+            quick_n=args.quick_eval_n,
             num_samples=args.eval_num_samples,
             temperature=args.temperature,
+            global_step_offset=global_step_offset,
         ))
 
     return trainer
@@ -844,12 +965,12 @@ def main():
 
     # Phase epochs
     ap.add_argument("--phase1_epochs", type=int, default=2)
-    ap.add_argument("--phase2_epochs", type=int, default=1)
+    ap.add_argument("--phase2_epochs", type=int, default=2)
     ap.add_argument("--phase3_epochs", type=int, default=3)
 
     # Training
-    ap.add_argument("--learning_rate", type=float, default=2e-6)
-    ap.add_argument("--beta", type=float, default=0.04,
+    ap.add_argument("--learning_rate", type=float, default=1e-5)
+    ap.add_argument("--beta", type=float, default=0.0,
                     help="KL penalty coefficient for GRPO")
     ap.add_argument("--per_device_train_batch_size", type=int, default=2)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -860,19 +981,21 @@ def main():
     ap.add_argument("--use_vllm", type=int, default=1)
 
     # LoRA
-    ap.add_argument("--lora_r", type=int, default=8)
-    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_r", type=int, default=32)
+    ap.add_argument("--lora_alpha", type=int, default=64)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
 
     # Logging & eval
     ap.add_argument("--logging_steps", type=int, default=10,
                     help="Log training metrics (loss, reward stats) every N steps")
-    ap.add_argument("--eval_every_steps", type=int, default=50,
-                    help="Run dev-set evaluation every N steps (0 to disable)")
+    ap.add_argument("--quick_eval_steps", type=int, default=100,
+                    help="Quick eval (greedy, subset) every N steps (0 to disable)")
+    ap.add_argument("--quick_eval_n", type=int, default=300,
+                    help="Number of dev examples for quick eval")
     ap.add_argument("--save_steps", type=int, default=100,
                     help="Save checkpoint every N steps")
     ap.add_argument("--eval_num_samples", type=int, default=8,
-                    help="Number of samples per prompt for pass@k evaluation")
+                    help="Number of samples per prompt for pass@k (full eval)")
 
     args = ap.parse_args()
 
@@ -911,6 +1034,9 @@ def main():
     print("Loading processor...")
     processor = AutoProcessor.from_pretrained(args.model_id, use_fast=True, padding_side="left")
 
+    global _tokenizer
+    _tokenizer = processor.tokenizer
+
     # ── Load datasets per difficulty ──
     print("Loading datasets...")
     phase_datasets = {}
@@ -940,7 +1066,8 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
         init_lora_weights=True,
     )
     model = get_peft_model(model, lora_config)
@@ -949,7 +1076,7 @@ def main():
     # ── Curriculum loop ──
     prompts_per_step = world_size * args.per_device_train_batch_size * args.gradient_accumulation_steps // args.num_generations
     phase_epochs = {1: args.phase1_epochs, 2: args.phase2_epochs, 3: args.phase3_epochs}
-    phase_betas = {1: 0.04, 2: 0.01, 3: 0.0}
+    phase_betas = {1: 0.0, 2: 0.0, 3: 0.0}
     global_step_offset = 0
 
     for phase in (1, 2, 3):
@@ -981,45 +1108,49 @@ def main():
 
         trainer.train()
 
-        # Run evaluation between phases
-        print(f"\n[Phase {phase}] Post-phase pass@{args.eval_num_samples} evaluation on val set...")
-        model.eval()
+        # Run evaluation between phases (all ranks participate, rank 0 reports)
+        # Use trainer.model which is the DDP-wrapped version on each rank
+        if is_main:
+            print(f"\n[Phase {phase}] Post-phase pass@{args.eval_num_samples} evaluation on val set...")
+        trainer.model.eval()
         phase_metrics = compute_eval_metrics(
-            model, processor, val_ds, args.max_completion_length,
+            trainer.model, processor, val_ds, args.max_completion_length,
             num_samples=args.eval_num_samples, temperature=args.temperature,
         )
-        model.train()
+        trainer.model.train()
 
-        # Prefix metrics with phase number
-        if wandb.run is not None:
-            tagged = {f"phase{phase}/{k}": v for k, v in phase_metrics.items()}
-            tagged["curriculum/phase"] = phase
-            wandb.log(tagged, step=global_step_offset + steps)
+        # phase_metrics is non-empty only on rank 0
+        if is_main and phase_metrics:
+            if wandb.run is not None:
+                tagged = {f"phase{phase}/{k}": v for k, v in phase_metrics.items()}
+                tagged["curriculum/phase"] = phase
+                wandb.log(tagged, step=global_step_offset + steps)
 
-        # Print phase summary
-        print(f"\n[Phase {phase}] Results:")
-        gsc = phase_metrics.get("eval/gen_strict_correct_pct", 0)
-        gac = phase_metrics.get("eval/gen_answer_only_correct_pct", 0)
-        psr = phase_metrics.get("eval/parse_success_rate", 0)
-        acl = phase_metrics.get("eval/avg_completion_len", 0)
-        print(f"  gen_strict_correct={gsc:.2%}  gen_answer_only_correct={gac:.2%}  parse_rate={psr:.2%}  avg_completion_len={acl:.0f}")
-        # Per-source reward
-        for key in sorted(phase_metrics):
-            if "reward_by_source/" in key and "/mean" in key:
-                src = key.split("/")[-2]
-                m = phase_metrics[key]
-                s = phase_metrics.get(key.replace("/mean", "/std"), 0)
-                print(f"  reward_by_source/{src}: {m:.3f} ± {s:.3f}")
-        # Per source x difficulty
-        for key in sorted(phase_metrics):
-            if "accuracy/" in key or "pass@" in key:
-                print(f"  {key}: {phase_metrics[key]:.4f}")
-            elif key.startswith("eval/reward/") and "/mean" in key:
-                base = key.replace("/mean", "")
-                m = phase_metrics[key]
-                s = phase_metrics.get(base + "/std", 0)
-                label = base.replace("eval/", "")
-                print(f"  {label}: {m:.3f} ± {s:.3f}")
+            print(f"\n[Phase {phase}] Results:")
+            gsc = phase_metrics.get("eval/gen_strict_correct_pct", 0)
+            gsi = phase_metrics.get("eval/gen_strict_incorrect_pct", 0)
+            psc = phase_metrics.get("eval/prompt_strict_correct_pct", 0)
+            psi = phase_metrics.get("eval/prompt_strict_incorrect_pct", 0)
+            psr = phase_metrics.get("eval/parse_success_rate", 0)
+            acl = phase_metrics.get("eval/avg_completion_tokens", 0)
+            print(f"  gen_strict_correct={gsc:.2%}  gen_strict_incorrect={gsi:.2%}")
+            print(f"  prompt_strict_correct={psc:.2%}  prompt_strict_incorrect={psi:.2%}")
+            print(f"  parse_success_rate={psr:.2%}  avg_completion_tokens={acl:.0f}")
+            for key in sorted(phase_metrics):
+                if "reward_by_source/" in key and "/mean" in key:
+                    src = key.split("/")[-2]
+                    m = phase_metrics[key]
+                    s = phase_metrics.get(key.replace("/mean", "/std"), 0)
+                    print(f"  reward_by_source/{src}: {m:.3f} ± {s:.3f}")
+            for key in sorted(phase_metrics):
+                if "accuracy/" in key or "pass@" in key:
+                    print(f"  {key}: {phase_metrics[key]:.4f}")
+                elif key.startswith("eval/reward/") and "/mean" in key:
+                    base = key.replace("/mean", "")
+                    m = phase_metrics[key]
+                    s = phase_metrics.get(base + "/std", 0)
+                    label = base.replace("eval/", "")
+                    print(f"  {label}: {m:.3f} ± {s:.3f}")
 
         global_step_offset += steps
 
