@@ -1,49 +1,62 @@
-# Visual Chain-of-Thought Reasoning with Qwen2.5-VL and GRPO
-## 📌 Project Overview
-This project implements **GRPO (Group Relative Policy Optimization)** with verifiable reward to improve **visual geometry reasoning** in **Qwen2.5-VL-3B-Instruct**. The training pipeline is built using **HuggingFace TRL**, **LoRA** for efficient parameter tuning, and **VLLM** for high-throughput rollout generation.
+# 📐 Visual Geometry Reasoning with Qwen2.5-VL & GRPO
 
-**Target Benchmark:** [MathVision](https://huggingface.co/datasets/mathvision/mathvision)
-**Training Data:** [VLAA-Thinking GeoQA and Synthesis subset](https://huggingface.co/datasets/open-thoughts/OpenThoughts-114k) and [Zebra CoT Geometry subset](https://huggingface.co/datasets/multimodal-reasoning-lab/Zebra-CoT)
+![Status](https://img.shields.io/badge/Status-Training_In_Progress-yellow)
+![Model](https://img.shields.io/badge/Base_Model-Qwen_2.5_VL_3B-green)
+![Tech](https://img.shields.io/badge/Stack-TRL_%7C_VLLM_%7C_LoRA-blue)
+
+## 📌 Project Overview
+This project implements **Group Relative Policy Optimization (GRPO)** to enhance **visual geometry reasoning** in the **Qwen2.5-VL-3B-Instruct** model. 
+
+Unlike standard fine-tuning, this pipeline uses Reinforcement Learning (RL) to enforce verifiable "Chain of Thought" (CoT) reasoning. The training system leverages **HuggingFace TRL** for the RL loop, **LoRA** for parameter-efficient tuning, and **VLLM** for high-throughput generation during the exploration phase.
+
+**Target Benchmark:** [MathVision](https://huggingface.co/datasets/mathvision/mathvision)  
+**Training Data:** [VLAA-Thinking (GeoQA/Synthesis)](https://huggingface.co/datasets/open-thoughts/OpenThoughts-114k) & [Zebra CoT Geometry](https://huggingface.co/datasets/multimodal-reasoning-lab/Zebra-CoT)
+
+---
 
 ## 🔬 Methodology: Structure-Aware Reward Modeling
-The goal is to bootstrap the model's reasoning capabilities by strictly enforcing a `<think>...</think><answer>...</answer>` structure via Reinforcement Learning (GRPO). The reward function $R(y)$ is designed to penalize "shortcut learning" (guessing the answer without reasoning).
-### Reward Function Logic
-The reward is assigned based on a hierarchy of constraints:
+The goal is to bootstrap the model's reasoning capabilities by strictly enforcing a structured output format:
+`<think>...reasoning steps...</think><answer>...final answer...</answer>`
+
+### The Reward Function
+To penalize "shortcut learning" (guessing without reasoning) while maintaining training stability, I implemented a hierarchical reward function.
+
+*(Note: If LaTeX does not render, please view in a compatible markdown viewer)*
+
 $$
 R(y) = 
 \begin{cases} 
-1.0 & \text{if Correct Answer AND Strict Format } \\
-0.5 & \text{if Correct Answer BUT only answer tags present} \\
-0.0 & \text{otherwise}
+1.0 & \text{if Correct Answer AND Strict Format (<think> tags present)} \\
+0.5 & \text{if Correct Answer BUT missing <think> tags} \\
+0.0 & \text{if Incorrect Answer}
 \end{cases}
 $$
 
-Future Work: Transition to Dense Process Rewards. Move from format-checking to logic-checking by implementing a heuristic that verifies intermediate steps inside the `<think>` block.
+**Why this matters:**
+* **Partial Credit (0.5):** Prevents reward collapse early in training when the model has not yet learned the XML tag structure but gets the answer right.
+* **Strict Format (1.0):** Incentivizes the model to shift probability mass toward explicit reasoning chains.
 
-## Project Structure
+---
+
+## 🛠️ Data Engineering & Curriculum
+This project moves beyond simple dataset loading by implementing a **Curriculum Learning** strategy based on problem complexity.
+
+### Data Processing Pipeline
+* **Normalization:** Converted VLAA-GeoQA's multiple-choice format `(A/B/C/D)` into open-form expressions.
+* **Math Standardization:** Normalized all ground truth values to standard LaTeX math expressions using `math_verify` equivalence checks.
+* **Difficulty Stratification:** Classified samples into 3 tiers based on reasoning length and ground-truth complexity:
+    * **Tier 1 (Easy):** Direct application of formulas.
+    * **Tier 2 (Medium):** Multi-step deduction.
+    * **Tier 3 (Hard):** Complex visual grounding required.
+
+### Project Structure
 ```bash
 ├── train/
-│   ├── train_grpo.py       # Main training loop using TRL
+│   └── train_grpo.py           # Main RL training loop (TRL + VLLM integration)
 ├── scripts/
-│   └── exploratory_eda.ipynb # Analysis of the dataset distribution
+│   ├── build_splits.py         # Stratified splitting (Train: 5k, Dev: 300, Test: 1k)
+│   ├── process_geoqa_data.py   # Multiple-choice to Open-ended conversion
+│   └── process_zebra_cot.py    # Geometry dataset cleaning
 ├── utils/
-│   └── extract_answers.py # helper functions to extract and normalize answers
+│   └── extract_answer.py       # Regex logic for answer extraction & normalization
 └── README.md
-```
-
-## Progress
-- **[X]Stage 1 — Process data and build verifiable scoring**
-  - Build data processing pipelines that convert VLAA-GeoQA multiple choice ground truth "(A/B/C/D)" to open-form expressions, and normalize the datasets' ground truths to standard latext math expressions.
-  - Implement `math_verify`-based equivalence reward.
-  - Classify dataset into 3 different difficulty levels (difficulty=1,2,3) based on the reference reasoning length and ground truth complexity.
-  - Set up train/dev/test splits: training set: 5000 examples; dev set: 300 examples; test set: 1000 examples. Difficulty ratio: 20% difficulty= 3; 60% difficulty=2; 20% difficulty=1.
-
-- **[In Progress ]Stage 2 — GRPO training**
-  - Introduce curriculum learning: divide the training to 3 phases. Phase 1 trains on difficulty=1 data; phase 2 trains on difficulty=2 data; phase 3 trains on difficulty=3 data.
-  - Prompt requires the model output to follow a strict format: <think>...</think><answer>...</answer>
-  - Reward design: Outcome based reward. reward = 1 if the output follows strict format and the answer is correct; reward = 0.5 if the output only has answer tags and the answer is correct; reward = 0 for other cases.
-  - Track: mean reward per source per difficulty level, accuracy, pass@k rate
-
-- **[ ]Stage 3 — Evaluation on Benchmark**
-- **[ ]Stage 4 — Denser reward**
-  - Explore partial-credit reward
