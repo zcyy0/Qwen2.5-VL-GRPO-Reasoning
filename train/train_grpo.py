@@ -9,11 +9,25 @@ and dev set evaluation between phases.
 All answer types are treated as math — extraction and normalisation use
 utils.extract_answer (extract_model_answer, normalize_answer_comprehensive).
 
-Launch:
-    accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 train/train_grpo_curriculum.py
+Launch (one phase at a time, each runs for exactly 1 epoch):
+    # Phase 1
+    accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 \
+        train/train_grpo_curriculum_2.py --phase 1
 
-Quick dry-run:
-    python train/train_grpo_curriculum.py --phase1_steps 2 --phase2_steps 2 --phase3_steps 2 --use_vllm 0
+    # Phase 2 (resume from phase 1 checkpoint)
+    accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 \
+        train/train_grpo_curriculum_2.py --phase 2 \
+        --resume_from outputs/grpo_curriculum/phase1/checkpoint-<N>
+
+    # Phase 3 (resume from phase 2 checkpoint)
+    accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 \
+        train/train_grpo_curriculum_2.py --phase 3 \
+        --resume_from outputs/grpo_curriculum/phase2/checkpoint-<N>
+
+    # Resume mid-phase (restores optimizer, dataloader position, step counter)
+    accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 \
+        train/train_grpo_curriculum_2.py --phase 2 \
+        --resume_checkpoint outputs/grpo_curriculum/phase2/checkpoint-300
 """
 
 import argparse
@@ -43,7 +57,7 @@ torch.set_float32_matmul_precision("high")
 from datasets import Dataset
 from datasets import Image as HFImage
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, TrainerCallback
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from trl import GRPOConfig, GRPOTrainer
 
 import wandb
@@ -204,13 +218,18 @@ class RewardTracker:
 
         total_comp_len = 0
         total_parse_ok = 0
+        src_correct = Counter()
+        src_total = Counter()
         for rew, diff, src, has_strict, has_answer_tags, is_correct, prompt_id, comp_len, parsed_ok in recs:
             by_diff[diff].append(rew)
             by_src[src].append(rew)
             all_prompts.add(prompt_id)
             total_comp_len += comp_len
+            src_total[src] += 1
             if parsed_ok:
                 total_parse_ok += 1
+            if is_correct:
+                src_correct[src] += 1
 
             if has_strict and is_correct:
                 n_strict_correct += 1
@@ -233,6 +252,9 @@ class RewardTracker:
         for src, vals in sorted(by_src.items()):
             metrics[f"train/reward_by_source/{src}/mean"] = sum(vals) / len(vals)
             metrics[f"train/reward_by_source/{src}/std"] = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+
+        for src in sorted(src_total.keys()):
+            metrics[f"train/accuracy_by_source/{src}"] = src_correct[src] / src_total[src]
 
         return metrics
 
@@ -351,7 +373,8 @@ class RewardTrackerCallback(TrainerCallback):
             for src in sources:
                 avg_r = metrics.get(f"train/reward_by_source/{src}/mean", 0)
                 std_r = metrics.get(f"train/reward_by_source/{src}/std", 0)
-                print(f"  reward_by_source/{src}: {avg_r:.3f} ± {std_r:.3f}")
+                acc_r = metrics.get(f"train/accuracy_by_source/{src}", 0)
+                print(f"  {src}: reward={avg_r:.3f}±{std_r:.3f}  accuracy={acc_r:.2%}")
             avg_clen = metrics.get("train/avg_completion_tokens", 0)
             print(f"  avg_completion_tokens={avg_clen:.0f}")
             if wandb.run is not None:
@@ -513,12 +536,20 @@ def generate_from_prompt(model, processor, prompt_text, image_pil,
         decoded = processor.decode(gen_tokens, skip_special_tokens=True)
         return decoded, int(gen_tokens.numel())
 
+    # Batch all samples in one generate call for GPU efficiency
+    batch_inputs = {}
+    for key, val in inputs.items():
+        if hasattr(val, "repeat"):
+            batch_inputs[key] = val.repeat(num_samples, *([1] * (val.dim() - 1)))
+        else:
+            batch_inputs[key] = val
+
+    out = model.generate(**batch_inputs, max_new_tokens=max_new_tokens,
+                         do_sample=True, temperature=temperature)
+    input_len = inputs["input_ids"].shape[1]
     results = []
-    for _ in range(num_samples):
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                             do_sample=True, temperature=temperature)
-        input_len = inputs["input_ids"].shape[1]
-        gen_tokens = out[0][input_len:]
+    for s in range(num_samples):
+        gen_tokens = out[s][input_len:]
         decoded = processor.decode(gen_tokens, skip_special_tokens=True)
         results.append((decoded, int(gen_tokens.numel())))
     return results
@@ -550,6 +581,8 @@ def compute_eval_metrics(model, processor, ds_subset: Dataset, max_new_tokens: i
 
     # Unwrap DDP model for inference
     eval_model = model.module if hasattr(model, "module") else model
+    was_training = eval_model.training
+    eval_model.eval()
 
     # Shard dataset across ranks
     if distributed:
@@ -559,68 +592,73 @@ def compute_eval_metrics(model, processor, ds_subset: Dataset, max_new_tokens: i
         local_ds = ds_subset
     n_local = len(local_ds)
 
-    # Pick 5 random local indices for debug printing (rank 0 only)
+    # Pick 10 random local indices for debug printing (rank 0 only)
     import random as _random
-    debug_indices = set(_random.sample(range(n_local), min(5, n_local)))
+    debug_indices = set(_random.sample(range(n_local), min(10, n_local)))
 
     # Collect per-generation records on each rank
     records = []
-    for i in range(n_local):
-        if rank == 0 and i % 10 == 0:
-            print(f"[Eval] Rank 0: {i}/{n_local} "
-                  f"(~{i * world_size}/{n_total} total)...")
+    with torch.no_grad():
+        for i in range(n_local):
+            if rank == 0 and i % 10 == 0:
+                print(f"[Eval] Rank 0: {i}/{n_local} "
+                      f"(~{i * world_size}/{n_total} total)...")
 
-        ex = local_ds[i]
-        src = ex["source"]
-        diff = ex.get("difficulty", 0)
-        pid = ex.get("id", str(i))
-        gold = ex["gt"]
+            ex = local_ds[i]
+            src = ex["source"]
+            diff = ex.get("difficulty", 0)
+            pid = ex.get("id", str(i))
+            gold = ex["gt"]
 
-        samples = generate_from_prompt(
-            eval_model, processor, ex["prompt_text"], ex["image"],
-            max_new_tokens, num_samples=k, temperature=temperature,
-        )
-        if k == 1:
-            samples = [samples]
+            samples = generate_from_prompt(
+                eval_model, processor, ex["prompt_text"], ex["image"],
+                max_new_tokens, num_samples=k, temperature=temperature,
+            )
+            if k == 1:
+                samples = [samples]
 
-        for s_idx, (decoded, clen) in enumerate(samples):
-            flags = tag_flags(decoded)
-            has_strict = flags["has_strict_block"]
-            has_answer_tags = flags["has_answer_open"] and flags["has_answer_close"]
+            for s_idx, (decoded, clen) in enumerate(samples):
+                flags = tag_flags(decoded)
+                has_strict = flags["has_strict_block"]
+                has_answer_tags = flags["has_answer_open"] and flags["has_answer_close"]
 
-            pred, _method = extract_model_answer(decoded)
-            parsed_ok = pred is not None
-            if parsed_ok:
-                score, gt_norm, pred_norm = score_one(str(gold), pred)
-                is_correct = score > 0
-            else:
-                is_correct = False
-                gt_norm = normalize_answer_comprehensive(str(gold))
-                pred_norm = None
+                pred, _method = extract_model_answer(decoded)
+                parsed_ok = pred is not None
+                if parsed_ok:
+                    score, gt_norm, pred_norm = score_one(str(gold), pred)
+                    is_correct = score > 0
+                else:
+                    is_correct = False
+                    gt_norm = normalize_answer_comprehensive(str(gold))
+                    pred_norm = None
 
-            if has_strict and is_correct:
-                rew = 1.0
-            elif has_strict:
-                rew = 0.1
-            else:
-                rew = 0.0
+                if has_strict and is_correct:
+                    rew = 1.0
+                elif has_strict:
+                    rew = 0.1
+                else:
+                    rew = 0.0
 
-            # Print detailed debug info for 5 random examples (sample 0 only)
-            if rank == 0 and i in debug_indices and s_idx == 0:
-                print(f"\n[DEBUG] Example {i}: src={src} diff={diff} id={pid}")
-                print(f"  Ground truth (raw):  {gold}")
-                print(f"  Ground truth (norm): {gt_norm}")
-                print(f"  Model output: {decoded}")
-                print(f"  Extracted answer: {pred}")
-                print(f"  Extracted (norm):  {pred_norm}")
-                print(f"  Correct={is_correct}  Strict={has_strict}  Reward={rew}")
+                # Print detailed debug info for 10 random examples (sample 0 only)
+                if rank == 0 and i in debug_indices and s_idx == 0 and diff == 3:
+                    print(f"\n[DEBUG] Example {i}: src={src} difficulty={diff} id={pid}")
+                    print(f"  Ground truth (raw):  {gold}")
+                    print(f"  Ground truth (norm): {gt_norm}")
+                    print(f"  Model output: {decoded}")
+                    print(f"  Extracted answer: {pred}")
+                    print(f"  Extracted (norm):  {pred_norm}")
+                    print(f"  Correct={is_correct}  Strict={has_strict}  Reward={rew}")
 
-            records.append({
-                "src": src, "diff": diff, "pid": pid,
-                "has_strict": has_strict, "has_answer_tags": has_answer_tags,
-                "is_correct": is_correct, "rew": rew, "clen": clen,
-                "parsed_ok": parsed_ok,
-            })
+                records.append({
+                    "src": src, "diff": diff, "pid": pid,
+                    "has_strict": has_strict, "has_answer_tags": has_answer_tags,
+                    "is_correct": is_correct, "rew": rew, "clen": clen,
+                    "parsed_ok": parsed_ok,
+                })
+
+    # Restore original training mode
+    if was_training:
+        eval_model.train()
 
     # Gather records from all ranks
     if distributed:
@@ -717,6 +755,41 @@ def compute_eval_metrics(model, processor, ds_subset: Dataset, max_new_tokens: i
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Eval metric printing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def print_eval_metrics(metrics, prefix="eval"):
+    """Print a summary of evaluation metrics."""
+    gsc = metrics.get(f"{prefix}/gen_strict_correct_pct", 0)
+    gsi = metrics.get(f"{prefix}/gen_strict_incorrect_pct", 0)
+    psc = metrics.get(f"{prefix}/prompt_strict_correct_pct", 0)
+    psi = metrics.get(f"{prefix}/prompt_strict_incorrect_pct", 0)
+    psr = metrics.get(f"{prefix}/parse_success_rate", 0)
+    acl = metrics.get(f"{prefix}/avg_completion_tokens", 0)
+    print(f"  gen_strict_correct={gsc:.2%}  gen_strict_incorrect={gsi:.2%}")
+    print(f"  prompt_strict_correct={psc:.2%}  prompt_strict_incorrect={psi:.2%}")
+    print(f"  parse_success_rate={psr:.2%}  avg_completion_tokens={acl:.0f}")
+    # Per-source reward (mean ± std)
+    src_keys = sorted(set(
+        k.split("/")[-2] for k in metrics if "reward_by_source/" in k and "/mean" in k
+    ))
+    for src in src_keys:
+        m = metrics.get(f"{prefix}/reward_by_source/{src}/mean", 0)
+        s = metrics.get(f"{prefix}/reward_by_source/{src}/std", 0)
+        print(f"  reward_by_source/{src}: {m:.3f} ± {s:.3f}")
+    # Per source x difficulty: accuracy, pass@k, reward mean±std
+    for key in sorted(metrics):
+        if "accuracy/" in key or "pass@" in key:
+            print(f"  {key}: {metrics[key]:.4f}")
+        elif key.startswith(f"{prefix}/reward/") and "/mean" in key:
+            base = key.replace("/mean", "")
+            m = metrics[key]
+            s = metrics.get(base + "/std", 0)
+            label = base.replace(f"{prefix}/", "")
+            print(f"  {label}: {m:.3f} ± {s:.3f}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Evaluation callback (runs within a phase)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -733,6 +806,7 @@ class EvalCallback(TrainerCallback):
 
     def __init__(self, processor, dev_dataset, max_new_tokens: int,
                  quick_every: int, phase_steps: int,
+                 steps_per_epoch: int = 0,
                  quick_n: int = 100, num_samples: int = 8,
                  temperature: float = 0.8, global_step_offset: int = 0,
                  seed: int = 42):
@@ -740,12 +814,19 @@ class EvalCallback(TrainerCallback):
         self.dev_dataset = dev_dataset          # full dev set
         self.max_new_tokens = max_new_tokens
         self.quick_every = quick_every
-        self.mid_step = phase_steps // 2        # full eval at midpoint
+        self.phase_steps = phase_steps
         self.num_samples = num_samples
         self.temperature = temperature
         self.global_step_offset = global_step_offset
         self._rank = (torch.distributed.get_rank()
                       if torch.distributed.is_initialized() else 0)
+
+        # Epoch boundary steps (exclude last epoch — handled by post-training eval)
+        if steps_per_epoch > 0:
+            total_epochs = max(1, round(phase_steps / steps_per_epoch))
+            self._epoch_steps = {steps_per_epoch * e for e in range(1, total_epochs)}
+        else:
+            self._epoch_steps = set()
 
         # Subset for quick eval (same on all ranks)
         n = len(dev_dataset)
@@ -757,35 +838,8 @@ class EvalCallback(TrainerCallback):
             indices = rng.sample(range(n), quick_n)
             self.quick_subset = dev_dataset.select(indices)
 
-    def _print_metrics(self, dev_metrics, prefix="eval"):
-        """Print metric summary (rank 0 only — caller must guard)."""
-        gsc = dev_metrics.get(f"{prefix}/gen_strict_correct_pct", 0)
-        gsi = dev_metrics.get(f"{prefix}/gen_strict_incorrect_pct", 0)
-        psc = dev_metrics.get(f"{prefix}/prompt_strict_correct_pct", 0)
-        psi = dev_metrics.get(f"{prefix}/prompt_strict_incorrect_pct", 0)
-        psr = dev_metrics.get(f"{prefix}/parse_success_rate", 0)
-        acl = dev_metrics.get(f"{prefix}/avg_completion_tokens", 0)
-        print(f"  gen_strict_correct={gsc:.2%}  gen_strict_incorrect={gsi:.2%}")
-        print(f"  prompt_strict_correct={psc:.2%}  prompt_strict_incorrect={psi:.2%}")
-        print(f"  parse_success_rate={psr:.2%}  avg_completion_tokens={acl:.0f}")
-        # Per-source reward (mean ± std)
-        src_keys = sorted(set(
-            k.split("/")[-2] for k in dev_metrics if "reward_by_source/" in k and "/mean" in k
-        ))
-        for src in src_keys:
-            m = dev_metrics.get(f"{prefix}/reward_by_source/{src}/mean", 0)
-            s = dev_metrics.get(f"{prefix}/reward_by_source/{src}/std", 0)
-            print(f"  reward_by_source/{src}: {m:.3f} ± {s:.3f}")
-        # Per source x difficulty: accuracy, pass@k, reward mean±std
-        for key in sorted(dev_metrics):
-            if "accuracy/" in key or "pass@" in key:
-                print(f"  {key}: {dev_metrics[key]:.4f}")
-            elif key.startswith(f"{prefix}/reward/") and "/mean" in key:
-                base = key.replace("/mean", "")
-                m = dev_metrics[key]
-                s = dev_metrics.get(base + "/std", 0)
-                label = base.replace(f"{prefix}/", "")
-                print(f"  {label}: {m:.3f} ± {s:.3f}")
+    def _print_metrics(self, metrics, prefix="eval"):
+        print_eval_metrics(metrics, prefix=prefix)
 
     def _run_quick_eval(self, model, state):
         was_training = model.training
@@ -802,8 +856,9 @@ class EvalCallback(TrainerCallback):
             model.train()
         # metrics is non-empty only on rank 0
         if self._rank == 0 and metrics:
+            # Drop pass@1 (redundant with accuracy when num_samples=1)
             metrics = {k.replace("eval/", "quick_eval/"): v
-                       for k, v in metrics.items()}
+                       for k, v in metrics.items() if "pass@" not in k}
             print(f"\n[Step {real_step}] Quick Eval Summary:")
             self._print_metrics(metrics, prefix="quick_eval")
             if wandb.run is not None:
@@ -834,8 +889,8 @@ class EvalCallback(TrainerCallback):
         if state.global_step == 0:
             return control
         model = kwargs["model"]
-        # Full eval at midpoint (skip quick eval on the same step)
-        if self.mid_step > 0 and state.global_step == self.mid_step:
+        # Full eval at epoch boundary (skip quick eval on those steps)
+        if state.global_step in self._epoch_steps:
             self._run_full_eval(model, state)
         elif self.quick_every > 0 and state.global_step % self.quick_every == 0:
             self._run_quick_eval(model, state)
@@ -872,6 +927,7 @@ def build_trainer(
     global_step_offset: int,
     dev_subset: Dataset,
     beta: float = 0.0,
+    steps_per_epoch: int = 0,
 ):
     """Create a GRPOTrainer for a single curriculum phase."""
     phase_output_dir = Path(args.output_dir) / f"phase{phase}"
@@ -935,6 +991,7 @@ def build_trainer(
             max_new_tokens=args.max_completion_length,
             quick_every=args.quick_eval_steps,
             phase_steps=max_steps,
+            steps_per_epoch=steps_per_epoch,
             quick_n=args.quick_eval_n,
             num_samples=args.eval_num_samples,
             temperature=args.temperature,
@@ -963,10 +1020,14 @@ def main():
     # Model
     ap.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
 
-    # Phase epochs
-    ap.add_argument("--phase1_epochs", type=int, default=2)
-    ap.add_argument("--phase2_epochs", type=int, default=2)
-    ap.add_argument("--phase3_epochs", type=int, default=3)
+    # Phase
+    ap.add_argument("--phase", type=int, required=True, choices=[1, 2, 3],
+                    help="Which curriculum phase (difficulty level) to train")
+    # Always trains for exactly 1 epoch per phase
+    ap.add_argument("--resume_from", type=str, default=None,
+                    help="Path to a LoRA checkpoint to start a NEW phase from (e.g. outputs/phase1/checkpoint-100)")
+    ap.add_argument("--resume_checkpoint", type=str, default=None,
+                    help="Path to a checkpoint to resume training MID-phase (restores optimizer, dataloader, step counter)")
 
     # Training
     ap.add_argument("--learning_rate", type=float, default=1e-5)
@@ -1037,22 +1098,17 @@ def main():
     global _tokenizer
     _tokenizer = processor.tokenizer
 
-    # ── Load datasets per difficulty ──
-    print("Loading datasets...")
-    phase_datasets = {}
-    for diff in (1, 2, 3):
-        ds = load_dataset_from_jsonl(train_file, images_root, images_root_alt, processor,
-                                     difficulty_filter=diff,
-                                     max_prompt_length=args.max_prompt_length)
-        phase_datasets[diff] = ds
-        print(f"  Phase {diff} (difficulty={diff}): {len(ds)} examples")
+    # ── Load datasets ──
+    phase = args.phase
+    print(f"Loading datasets for phase {phase} (difficulty={phase})...")
+    train_ds = load_dataset_from_jsonl(train_file, images_root, images_root_alt, processor,
+                                       difficulty_filter=phase,
+                                       max_prompt_length=args.max_prompt_length)
+    print(f"  Train (difficulty={phase}): {len(train_ds)} examples")
 
-    # Load val set (no difficulty filter — use everything)
     val_ds = load_dataset_from_jsonl(val_file, images_root, images_root_alt, processor,
                                      max_prompt_length=args.max_prompt_length)
     print(f"  Val set: {len(val_ds)} examples")
-
-    print(f"  Eval: using full val set ({len(val_ds)} examples)")
 
     # ── Model + LoRA ──
     print("Loading model (bf16)...")
@@ -1060,109 +1116,88 @@ def main():
         args.model_id, torch_dtype=torch.bfloat16,
     )
 
-    print("Applying LoRA...")
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        init_lora_weights=True,
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    lora_load_path = args.resume_checkpoint or args.resume_from
+    if lora_load_path:
+        print(f"Loading LoRA checkpoint from {lora_load_path}...")
+        model = PeftModel.from_pretrained(model, lora_load_path, is_trainable=True)
+        model.print_trainable_parameters()
+    else:
+        print("Applying fresh LoRA...")
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+            init_lora_weights=True,
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
-    # ── Curriculum loop ──
+    # ── Training ──
     prompts_per_step = world_size * args.per_device_train_batch_size * args.gradient_accumulation_steps // args.num_generations
-    phase_epochs = {1: args.phase1_epochs, 2: args.phase2_epochs, 3: args.phase3_epochs}
-    phase_betas = {1: 0.0, 2: 0.0, 3: 0.0}
-    global_step_offset = 0
+    steps_per_epoch = math.ceil(len(train_ds) / prompts_per_step)
+    steps = steps_per_epoch  # exactly 1 epoch
 
-    for phase in (1, 2, 3):
-        train_ds = phase_datasets[phase]
-        beta = phase_betas[phase]
-        epochs = phase_epochs[phase]
-        steps = math.ceil(len(train_ds) / prompts_per_step) * epochs
+    # KL penalty: 0 for phase 1, 0.01 for phases 2 & 3
+    beta = args.beta if phase == 1 else 0.01
 
-        print("\n" + "=" * 70)
-        print(f"PHASE {phase}  (difficulty={phase}, {len(train_ds)} examples, "
-              f"{epochs} epochs, {steps} steps, {prompts_per_step} prompts/step, beta={beta})")
-        print("=" * 70)
+    print("\n" + "=" * 70)
+    print(f"PHASE {phase}  (difficulty={phase}, {len(train_ds)} examples, "
+          f"1 epoch, {steps} steps, {prompts_per_step} prompts/step, beta={beta})")
+    if args.resume_checkpoint:
+        print(f"  Resuming mid-phase from: {args.resume_checkpoint}")
+    elif args.resume_from:
+        print(f"  Starting new phase from: {args.resume_from}")
+    print("=" * 70)
 
+    if wandb.run is not None:
+        wandb.log({"curriculum/phase": phase}, step=0)
+
+    trainer = build_trainer(
+        model=model,
+        processor=processor,
+        train_ds=train_ds,
+        eval_ds=val_ds,
+        args=args,
+        phase=phase,
+        max_steps=steps,
+        global_step_offset=0,
+        dev_subset=val_ds,
+        beta=beta,
+        steps_per_epoch=steps_per_epoch,
+    )
+
+    trainer.train(resume_from_checkpoint=args.resume_checkpoint)
+
+    # ── Post-training evaluation ──
+    if is_main:
+        print(f"\n[Phase {phase}] Post-training pass@{args.eval_num_samples} evaluation on val set...")
+    trainer.model.eval()
+    phase_metrics = compute_eval_metrics(
+        trainer.model, processor, val_ds, args.max_completion_length,
+        num_samples=args.eval_num_samples, temperature=args.temperature,
+    )
+    trainer.model.train()
+
+    if is_main and phase_metrics:
         if wandb.run is not None:
-            wandb.log({"curriculum/phase": phase}, step=global_step_offset)
+            tagged = {f"phase{phase}/{k}": v for k, v in phase_metrics.items()}
+            tagged["curriculum/phase"] = phase
+            wandb.log(tagged, step=steps)
 
-        trainer = build_trainer(
-            model=model,
-            processor=processor,
-            train_ds=train_ds,
-            eval_ds=val_ds,
-            args=args,
-            phase=phase,
-            max_steps=steps,
-            global_step_offset=global_step_offset,
-            dev_subset=val_ds,
-            beta=beta,
-        )
-
-        trainer.train()
-
-        # Run evaluation between phases (all ranks participate, rank 0 reports)
-        # Use trainer.model which is the DDP-wrapped version on each rank
-        if is_main:
-            print(f"\n[Phase {phase}] Post-phase pass@{args.eval_num_samples} evaluation on val set...")
-        trainer.model.eval()
-        phase_metrics = compute_eval_metrics(
-            trainer.model, processor, val_ds, args.max_completion_length,
-            num_samples=args.eval_num_samples, temperature=args.temperature,
-        )
-        trainer.model.train()
-
-        # phase_metrics is non-empty only on rank 0
-        if is_main and phase_metrics:
-            if wandb.run is not None:
-                tagged = {f"phase{phase}/{k}": v for k, v in phase_metrics.items()}
-                tagged["curriculum/phase"] = phase
-                wandb.log(tagged, step=global_step_offset + steps)
-
-            print(f"\n[Phase {phase}] Results:")
-            gsc = phase_metrics.get("eval/gen_strict_correct_pct", 0)
-            gsi = phase_metrics.get("eval/gen_strict_incorrect_pct", 0)
-            psc = phase_metrics.get("eval/prompt_strict_correct_pct", 0)
-            psi = phase_metrics.get("eval/prompt_strict_incorrect_pct", 0)
-            psr = phase_metrics.get("eval/parse_success_rate", 0)
-            acl = phase_metrics.get("eval/avg_completion_tokens", 0)
-            print(f"  gen_strict_correct={gsc:.2%}  gen_strict_incorrect={gsi:.2%}")
-            print(f"  prompt_strict_correct={psc:.2%}  prompt_strict_incorrect={psi:.2%}")
-            print(f"  parse_success_rate={psr:.2%}  avg_completion_tokens={acl:.0f}")
-            for key in sorted(phase_metrics):
-                if "reward_by_source/" in key and "/mean" in key:
-                    src = key.split("/")[-2]
-                    m = phase_metrics[key]
-                    s = phase_metrics.get(key.replace("/mean", "/std"), 0)
-                    print(f"  reward_by_source/{src}: {m:.3f} ± {s:.3f}")
-            for key in sorted(phase_metrics):
-                if "accuracy/" in key or "pass@" in key:
-                    print(f"  {key}: {phase_metrics[key]:.4f}")
-                elif key.startswith("eval/reward/") and "/mean" in key:
-                    base = key.replace("/mean", "")
-                    m = phase_metrics[key]
-                    s = phase_metrics.get(base + "/std", 0)
-                    label = base.replace("eval/", "")
-                    print(f"  {label}: {m:.3f} ± {s:.3f}")
-
-        global_step_offset += steps
-
-        # Clean up trainer (but keep the model — weights carry over)
-        del trainer
-        torch.cuda.empty_cache()
+        print(f"\n[Phase {phase}] Results:")
+        print_eval_metrics(phase_metrics, prefix="eval")
 
     # ── Final save ──
-    final_dir = output_dir / "final"
+    final_dir = output_dir / f"phase{phase}_final"
     model.save_pretrained(str(final_dir))
     processor.save_pretrained(str(final_dir))
-    print(f"\nTraining complete. Final model saved to {final_dir}")
+    print(f"\nPhase {phase} complete. Model saved to {final_dir}")
+
+    del trainer
+    torch.cuda.empty_cache()
 
     if wandb.run is not None:
         wandb.finish()
